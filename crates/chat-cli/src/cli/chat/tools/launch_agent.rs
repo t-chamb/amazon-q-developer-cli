@@ -37,7 +37,7 @@ use super::{
     InvokeOutput,
     OutputKind,
 };
-use crate::platform::Context;
+use crate::os::Os;
 
 /// Tool for launching a new Q agent as a background process
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -263,7 +263,7 @@ impl SubAgent {
     }
 
     /// non-empty prompt validation
-    pub async fn validate(&self, _ctx: &Context) -> Result<()> {
+    pub async fn validate(&self, _os: &Os) -> Result<()> {
         if self.prompt.trim().is_empty() {
             return Err(eyre::eyre!("Prompt cannot be empty"));
         }

@@ -19,40 +19,103 @@ pub mod tools;
 pub mod util;
 
 use std::borrow::Cow;
-use std::collections::{HashMap, VecDeque};
-use std::io::{IsTerminal, Read, Write};
+use std::collections::{
+    HashMap,
+    VecDeque,
+};
+use std::io::{
+    IsTerminal,
+    Read,
+    Write,
+};
 use std::os::unix::fs::PermissionsExt;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
+use std::time::{
+    Duration,
+    Instant,
+};
 
 use amzn_codewhisperer_client::types::SubscriptionStatus;
-use clap::{Args, CommandFactory, Parser};
+use clap::{
+    Args,
+    CommandFactory,
+    Parser,
+};
 pub use conversation::ConversationState;
 use conversation::TokenWarningLevel;
-use crossterm::style::{Attribute, Color, Stylize};
-use crossterm::{cursor, execute, queue, style, terminal};
-use eyre::{Report, Result, bail, eyre};
+use crossterm::style::{
+    Attribute,
+    Color,
+    Stylize,
+};
+use crossterm::{
+    cursor,
+    execute,
+    queue,
+    style,
+    terminal,
+};
+use eyre::{
+    Report,
+    Result,
+    bail,
+    eyre,
+};
 use input_source::InputSource;
-use message::{AssistantMessage, AssistantToolUse, ToolUseResult, ToolUseResultBlock};
-use parse::{ParseState, interpret_markdown};
-use parser::{RecvErrorKind, ResponseParser};
+use message::{
+    AssistantMessage,
+    AssistantToolUse,
+    ToolUseResult,
+    ToolUseResultBlock,
+};
+use parse::{
+    ParseState,
+    interpret_markdown,
+};
+use parser::{
+    RecvErrorKind,
+    ResponseParser,
+};
 use regex::Regex;
-use spinners::{Spinner, Spinners};
+use spinners::{
+    Spinner,
+    Spinners,
+};
 use thiserror::Error;
 use time::OffsetDateTime;
 use token_counter::TokenCounter;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{
+    AsyncReadExt,
+    AsyncWriteExt,
+};
 use tokio::net::UnixListener;
 use tokio::signal::ctrl_c;
-use tool_manager::{ToolManager, ToolManagerBuilder};
+use tokio::sync::Mutex;
+use tool_manager::{
+    ToolManager,
+    ToolManagerBuilder,
+};
 use tools::gh_issue::GhIssueContext;
-use tools::{OutputKind, QueuedTool, Tool, ToolSpec};
-use tracing::{debug, error, info, trace, warn};
+use tools::{
+    OutputKind,
+    QueuedTool,
+    Tool,
+    ToolSpec,
+};
+use tracing::{
+    debug,
+    error,
+    info,
+    trace,
+    warn,
+};
 use util::images::RichImageBlock;
 use util::ui::draw_box;
-use util::{animate_output, play_notification_bell};
+use util::{
+    animate_output,
+    play_notification_bell,
+};
 use winnow::Partial;
 use winnow::stream::Offset;
 
@@ -64,13 +127,23 @@ use crate::auth::AuthError;
 use crate::auth::builder_id::is_idc_user;
 use crate::cli::agent::Agents;
 use crate::cli::chat::cli::SlashCommand;
-use crate::cli::chat::cli::model::{MODEL_OPTIONS, default_model_id};
-use crate::cli::chat::cli::prompts::{GetPromptError, PromptsSubcommand};
+use crate::cli::chat::cli::model::{
+    MODEL_OPTIONS,
+    default_model_id,
+};
+use crate::cli::chat::cli::prompts::{
+    GetPromptError,
+    PromptsSubcommand,
+};
 use crate::database::settings::Setting;
 use crate::mcp_client::Prompt;
 use crate::os::Os;
 use crate::telemetry::core::ToolUseEventBuilder;
-use crate::telemetry::{ReasonCode, TelemetryResult, get_error_reason};
+use crate::telemetry::{
+    ReasonCode,
+    TelemetryResult,
+    get_error_reason,
+};
 use crate::util::MCP_SERVER_TOOL_DELIMITER;
 
 const LIMIT_REACHED_TEXT: &str = color_print::cstr! { "You've used all your free requests for this month. You have two options:

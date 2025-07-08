@@ -29,7 +29,6 @@ use tokio::net::UnixStream;
 use tokio::signal::ctrl_c;
 
 use crate::cli::OutputFormat;
-use crate::cli::chat::util::shared_writer::SharedWriter;
 use crate::util::choose;
 
 // Arguments for agent command
@@ -118,7 +117,7 @@ pub async fn list_agents(args: ListArgs) -> Result<ExitCode> {
     // Set up for live updates
     let refresh_interval = tokio::time::Duration::from_secs(1);
     let mut interval = tokio::time::interval(refresh_interval);
-    let mut output = SharedWriter::stdout();
+    let mut output = std::io::stdout();
     let display_once = args.single;
 
     println!("Live agent status (press Ctrl+C to exit)...");
@@ -284,7 +283,7 @@ pub async fn compare_agents(args: CompareArgs) -> Result<ExitCode> {
     }
 
     // Create a new tmux session
-    let mut output = SharedWriter::stdout();
+    let mut output = std::io::stdout();
     let main_pid: u32 = std::process::id();
     let session_name = format!("qagent-compare-{}", main_pid);
     let tmux_create = Command::new("tmux")

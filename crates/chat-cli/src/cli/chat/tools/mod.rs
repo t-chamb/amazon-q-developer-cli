@@ -10,10 +10,16 @@ pub mod use_aws;
 
 use std::borrow::Borrow;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{
+    Path,
+    PathBuf,
+};
 
 use crossterm::queue;
-use crossterm::style::{self, Color};
+use crossterm::style::{
+    self,
+    Color,
+};
 use custom_tool::CustomTool;
 use execute::ExecuteCommand;
 use eyre::Result;
@@ -21,18 +27,27 @@ use fs_read::FsRead;
 use fs_write::FsWrite;
 use gh_issue::GhIssue;
 use knowledge::Knowledge;
-use launch_agent::{SubAgent, SubAgentWrapper};
-use serde::{Deserialize, Serialize};
+use launch_agent::{
+    SubAgent,
+    SubAgentWrapper,
+};
+use serde::{
+    Deserialize,
+    Serialize,
+};
 use thinking::Thinking;
 use use_aws::UseAws;
 
 use super::consts::MAX_TOOL_RESPONSE_SIZE;
 use super::util::images::RichImageBlocks;
-use crate::cli::agent::{Agent, PermissionEvalResult};
+use crate::cli::agent::{
+    Agent,
+    PermissionEvalResult,
+};
 use crate::os::Os;
 
 pub const DEFAULT_APPROVE: [&str; 1] = ["fs_read"];
-pub const NATIVE_TOOLS: [&str; 7] = [
+pub const NATIVE_TOOLS: [&str; 8] = [
     "fs_read",
     "fs_write",
     #[cfg(windows)]
@@ -43,6 +58,7 @@ pub const NATIVE_TOOLS: [&str; 7] = [
     "gh_issue",
     "knowledge",
     "thinking",
+    "launch_agent",
 ];
 
 /// Represents an executable tool use.
@@ -91,7 +107,7 @@ impl Tool {
             Tool::GhIssue(_) => PermissionEvalResult::Allow,
             Tool::Thinking(_) => PermissionEvalResult::Allow,
             Tool::Knowledge(_) => PermissionEvalResult::Ask,
-            Tool::SubAgentWrapper(_) => true,
+            Tool::SubAgentWrapper(_) => PermissionEvalResult::Ask,
         }
     }
 
@@ -110,7 +126,7 @@ impl Tool {
                 let wrapper = SubAgentWrapper {
                     subagents: sub_agents.clone(),
                 };
-                wrapper.invoke(updates).await
+                wrapper.invoke(stdout).await
             },
         }
     }
@@ -130,7 +146,7 @@ impl Tool {
                 let wrapper = SubAgentWrapper {
                     subagents: sub_agents.clone(),
                 };
-                wrapper.queue_description(updates)
+                wrapper.queue_description(output)
             },
         }
     }
@@ -149,7 +165,7 @@ impl Tool {
             Tool::SubAgentWrapper(sub_agents) => {
                 // Validate all agents in the vector
                 for agent in sub_agents.iter() {
-                    agent.validate(ctx).await?;
+                    agent.validate(os).await?;
                 }
                 Ok(())
             },
