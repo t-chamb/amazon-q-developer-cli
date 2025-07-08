@@ -975,22 +975,30 @@ impl Default for ChatState {
 impl ChatSession {
     /// Returns current status state of chat for orchestrator agent to display
     fn get_current_status(&self, current_state: &ChatState) -> String {
+        // Display previous tool use summary at all times if available
+        if let Some((name, summary)) = &self.last_tool_use {
+            if !summary.is_empty() {
+                return format!("Running {}: {}", name, summary);
+            }
+        }
+
         match current_state {
             ChatState::PromptUser { .. } if self.pending_tool_index.is_some() => {
                 "waiting for tool approval".to_string()
             },
+            // edge case: if self.last_tool_use not set yet and get_current_status called.
             ChatState::ExecuteTools => {
                 if !self.tool_uses.is_empty() {
                     let tool = &self.tool_uses[0];
-                    // TODO: enable this for fs_write as well
-                    // Check if it's an ExecuteCommand tool and extract the summary
                     if let Tool::ExecuteCommand(execute_cmd) = &tool.tool {
                         if let Some(summary) = &execute_cmd.summary {
                             return format!("Running {}: {}", tool.name, summary);
                         }
+                    } else if let Tool::FsWrite(fswrite) = &tool.tool {
+                        if let Some(summary) = &fswrite.get_summary() {
+                            return format!("Running {}: {}", tool.name, summary);
+                        }
                     }
-
-                    // Default to tool name if no summary available
                     format!("Running {}", tool.name)
                 } else {
                     "executing tool".to_string()
@@ -1003,15 +1011,7 @@ impl ChatSession {
                 ToolUseStatus::RetryInProgress(_) => "retrying tool use".to_string(),
                 ToolUseStatus::Idle => {
                     // Use last tool use if exists or default to generating response
-                    if self.spinner.is_some() {
-                        if let Some((name, summary)) = &self.last_tool_use {
-                            if !summary.is_empty() {
-                                return format!("Processing results from {}: {}", name, summary);
-                            }
-                            return format!("Processing results from {}", name);
-                        }
-                        "generating response".to_string()
-                    } else if self.conversation.next_user_message().is_some() {
+                    if self.conversation.next_user_message().is_some() {
                         "processing request".to_string()
                     } else {
                         "waiting for user input".to_string()
@@ -1128,6 +1128,18 @@ impl ChatSession {
     }
 
     async fn spawn(&mut self, os: &mut Os) -> Result<()> {
+        // socket setup before displaying any text to user
+        let (profile, tokens_used, context_window_percent, status, message_receiver) = Self::setup_agent_socket().await;
+        if let Some(mr) = message_receiver {
+            self.message_receiver = Some(mr);
+        }
+        let mut agent_socket_values = AgentSocketInfo {
+            profile,
+            tokens_used,
+            context_window_percent,
+            status,
+        };
+
         let is_small_screen = self.terminal_width() < GREETING_BREAK_POINT;
         if os
             .database
@@ -1208,16 +1220,6 @@ impl ChatSession {
             self.inner = Some(ChatState::HandleInput { input: user_input });
         }
 
-        let (profile, tokens_used, context_window_percent, status, message_receiver) = Self::setup_agent_socket().await;
-        if let Some(mr) = message_receiver {
-            self.message_receiver = Some(mr);
-        }
-        let mut agent_socket_values = AgentSocketInfo {
-            profile,
-            tokens_used,
-            context_window_percent,
-            status,
-        };
         while !matches!(self.inner, Some(ChatState::Exit)) {
             self.next(os, &mut agent_socket_values).await?;
         }
@@ -1775,15 +1777,7 @@ impl ChatSession {
             let invoke_result = tool.tool.invoke(os, &mut self.stdout).await;
 
             // store last tool use for current status
-            if let Tool::ExecuteCommand(execute_cmd) = &tool.tool {
-                if let Some(summary) = &execute_cmd.summary {
-                    self.last_tool_use = Some((tool.name.clone(), summary.clone()));
-                } else {
-                    self.last_tool_use = Some((tool.name.clone(), String::new()));
-                }
-            } else {
-                self.last_tool_use = Some((tool.name.clone(), String::new()));
-            }
+            self.last_tool_use = Some((tool.name.clone(), Self::get_tool_summary(&tool.tool)));
 
             if self.spinner.is_some() {
                 queue!(
@@ -1910,6 +1904,14 @@ impl ChatSession {
                 )
                 .await?,
         ));
+    }
+
+    fn get_tool_summary(tool: &Tool) -> String {
+        match tool {
+            Tool::ExecuteCommand(execute_cmd) => execute_cmd.summary.clone().unwrap_or_default(),
+            Tool::FsWrite(fswrite) => fswrite.get_summary().cloned().unwrap_or_default(),
+            _ => String::new(),
+        }
     }
 
     async fn handle_response(&mut self, os: &mut Os, response: SendMessageOutput) -> Result<ChatState, ChatError> {

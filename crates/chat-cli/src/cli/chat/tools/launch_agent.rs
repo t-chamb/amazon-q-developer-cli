@@ -313,6 +313,7 @@ async fn spawn_agent_task(
     if let Some(model_arg) = model {
         cmd.arg(format!("--model={}", model_arg));
     }
+    cmd.arg("--no-interactive");
     cmd.arg("--trust-all-tools");
     cmd.arg(prompt);
     cmd.env("Q_SUBAGENT", "1");
