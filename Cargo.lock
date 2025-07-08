@@ -1216,6 +1216,7 @@ dependencies = [
  "indoc",
  "insta",
  "libc",
+ "libproc",
  "mimalloc",
  "mockito",
  "nix 0.29.0",

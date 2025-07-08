@@ -19,92 +19,40 @@ pub mod tools;
 pub mod util;
 
 use std::borrow::Cow;
-use std::collections::{
-    HashMap,
-    VecDeque,
-};
-use std::io::{
-    IsTerminal,
-    Read,
-    Write,
-};
+use std::collections::{HashMap, VecDeque};
+use std::io::{IsTerminal, Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::process::ExitCode;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 
 use amzn_codewhisperer_client::types::SubscriptionStatus;
-use clap::{
-    Args,
-    CommandFactory,
-    Parser,
-};
+use clap::{Args, CommandFactory, Parser};
 pub use conversation::ConversationState;
 use conversation::TokenWarningLevel;
-use crossterm::style::{
-    Attribute,
-    Color,
-    Stylize,
-};
-use crossterm::{
-    cursor,
-    execute,
-    queue,
-    style,
-    terminal,
-};
-use eyre::{
-    Report,
-    Result,
-    bail,
-    eyre,
-};
+use crossterm::style::{Attribute, Color, Stylize};
+use crossterm::{cursor, execute, queue, style, terminal};
+use eyre::{Report, Result, bail, eyre};
 use input_source::InputSource;
-use message::{
-    AssistantMessage,
-    AssistantToolUse,
-    ToolUseResult,
-    ToolUseResultBlock,
-};
-use parse::{
-    ParseState,
-    interpret_markdown,
-};
-use parser::{
-    RecvErrorKind,
-    ResponseParser,
-};
+use message::{AssistantMessage, AssistantToolUse, ToolUseResult, ToolUseResultBlock};
+use parse::{ParseState, interpret_markdown};
+use parser::{RecvErrorKind, ResponseParser};
 use regex::Regex;
-use spinners::{
-    Spinner,
-    Spinners,
-};
+use spinners::{Spinner, Spinners};
 use thiserror::Error;
 use time::OffsetDateTime;
 use token_counter::TokenCounter;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UnixListener;
 use tokio::signal::ctrl_c;
-use tool_manager::{
-    ToolManager,
-    ToolManagerBuilder,
-};
+use tool_manager::{ToolManager, ToolManagerBuilder};
 use tools::gh_issue::GhIssueContext;
-use tools::{
-    OutputKind,
-    QueuedTool,
-    Tool,
-    ToolSpec,
-};
-use tracing::{
-    debug,
-    error,
-    info,
-    trace,
-    warn,
-};
+use tools::{OutputKind, QueuedTool, Tool, ToolSpec};
+use tracing::{debug, error, info, trace, warn};
 use util::images::RichImageBlock;
 use util::ui::draw_box;
-use util::{
-    animate_output,
-    play_notification_bell,
-};
+use util::{animate_output, play_notification_bell};
 use winnow::Partial;
 use winnow::stream::Offset;
 
@@ -116,23 +64,13 @@ use crate::auth::AuthError;
 use crate::auth::builder_id::is_idc_user;
 use crate::cli::agent::Agents;
 use crate::cli::chat::cli::SlashCommand;
-use crate::cli::chat::cli::model::{
-    MODEL_OPTIONS,
-    default_model_id,
-};
-use crate::cli::chat::cli::prompts::{
-    GetPromptError,
-    PromptsSubcommand,
-};
+use crate::cli::chat::cli::model::{MODEL_OPTIONS, default_model_id};
+use crate::cli::chat::cli::prompts::{GetPromptError, PromptsSubcommand};
 use crate::database::settings::Setting;
 use crate::mcp_client::Prompt;
 use crate::os::Os;
 use crate::telemetry::core::ToolUseEventBuilder;
-use crate::telemetry::{
-    ReasonCode,
-    TelemetryResult,
-    get_error_reason,
-};
+use crate::telemetry::{ReasonCode, TelemetryResult, get_error_reason};
 use crate::util::MCP_SERVER_TOOL_DELIMITER;
 
 const LIMIT_REACHED_TEXT: &str = color_print::cstr! { "You've used all your free requests for this month. You have two options:
@@ -153,6 +91,16 @@ pub const EXTRA_HELP: &str = color_print::cstr! {"
 <em>chat.editMode</em>       <black!>The prompt editing mode (vim or emacs)</black!>
                     <black!>Change using: q settings chat.skimCommandKey x</black!>
 "};
+
+/// Shared variables that are updated inside main chat loop
+/// Allows orchestrator to see status of children agents
+#[derive(Debug)]
+pub struct AgentSocketInfo {
+    profile: Arc<Mutex<String>>,
+    tokens_used: Arc<Mutex<usize>>,
+    context_window_percent: Arc<Mutex<f32>>,
+    status: Arc<Mutex<String>>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Args)]
 pub struct ChatArgs {
@@ -307,6 +255,7 @@ impl ChatArgs {
             model_id,
             tool_config,
             !self.no_interactive,
+            None,
         )
         .await?
         .spawn(os)
@@ -490,6 +439,9 @@ pub struct ChatSession {
     pending_prompts: VecDeque<Prompt>,
     interactive: bool,
     inner: Option<ChatState>,
+    /// Channel for agent piping
+    message_receiver: Option<tokio::sync::mpsc::Receiver<String>>,
+    last_tool_use: Option<(String, String)>,
 }
 
 impl ChatSession {
@@ -508,6 +460,7 @@ impl ChatSession {
         model_id: Option<String>,
         tool_config: HashMap<String, ToolSpec>,
         interactive: bool,
+        message_receiver: Option<tokio::sync::mpsc::Receiver<String>>,
     ) -> Result<Self> {
         let valid_model_id = match model_id {
             Some(id) => id,
@@ -590,12 +543,45 @@ impl ChatSession {
             pending_prompts: VecDeque::new(),
             interactive,
             inner: Some(ChatState::default()),
+            message_receiver,
+            last_tool_use: None,
         })
     }
 
-    pub async fn next(&mut self, os: &mut Os) -> Result<(), ChatError> {
+    pub async fn next(&mut self, os: &mut Os, socket_info: &mut AgentSocketInfo) -> Result<(), ChatError> {
         // Update conversation state with new tool information
         self.conversation.update_state(false).await;
+
+        // setup arc variables for updating status
+        let AgentSocketInfo {
+            profile,
+            tokens_used,
+            context_window_percent,
+            status,
+        } = socket_info;
+
+        // Update shared state values for socket communication
+        if let Some(current_profile) = self.conversation.current_profile() {
+            let mut profile_guard = profile.lock().await;
+            *profile_guard = current_profile.to_string();
+        }
+
+        let backend_state = self
+            .conversation
+            .backend_conversation_state(&os, false, &mut self.stdout)
+            .await;
+        let data = backend_state?.calculate_conversation_size();
+        let mut tokens_guard = tokens_used.lock().await;
+        *tokens_guard = *data.context_messages + *data.assistant_messages + *data.user_messages;
+        let mut percent_guard = context_window_percent.lock().await;
+        *percent_guard = (*tokens_guard as f32 / consts::CONTEXT_WINDOW_SIZE as f32) * 100.0;
+        let mut status_guard = status.lock().await;
+        let default_state = ChatState::default();
+        let current_chat_state = self.inner.as_ref().unwrap_or(&default_state);
+        *status_guard = self.get_current_status(current_chat_state).to_string();
+        std::mem::drop(tokens_guard);
+        std::mem::drop(status_guard);
+        std::mem::drop(percent_guard);
 
         let ctrl_c_stream = ctrl_c();
         let result = match self.inner.take().expect("state must always be Some") {
@@ -914,6 +900,160 @@ impl Default for ChatState {
 }
 
 impl ChatSession {
+    /// Returns current status state of chat for orchestrator agent to display
+    fn get_current_status(&self, current_state: &ChatState) -> String {
+        match current_state {
+            ChatState::PromptUser { .. } if self.pending_tool_index.is_some() => {
+                "waiting for tool approval".to_string()
+            },
+            ChatState::ExecuteTools => {
+                if !self.tool_uses.is_empty() {
+                    let tool = &self.tool_uses[0];
+                    // TODO: enable this for fs_write as well
+                    // Check if it's an ExecuteCommand tool and extract the summary
+                    if let Tool::ExecuteCommand(execute_cmd) = &tool.tool {
+                        if let Some(summary) = &execute_cmd.summary {
+                            return format!("Running {}: {}", tool.name, summary);
+                        }
+                    }
+
+                    // Default to tool name if no summary available
+                    format!("Running {}", tool.name)
+                } else {
+                    "executing tool".to_string()
+                }
+            },
+            ChatState::ValidateTools(_) => "validating tools".to_string(),
+            ChatState::HandleResponseStream(_) => "generating response".to_string(),
+            ChatState::CompactHistory { .. } => "compacting history".to_string(),
+            _ => match &self.tool_use_status {
+                ToolUseStatus::RetryInProgress(_) => "retrying tool use".to_string(),
+                ToolUseStatus::Idle => {
+                    // Use last tool use if exists or default to generating response
+                    if self.spinner.is_some() {
+                        if let Some((name, summary)) = &self.last_tool_use {
+                            if !summary.is_empty() {
+                                return format!("Processing results from {}: {}", name, summary);
+                            }
+                            return format!("Processing results from {}", name);
+                        }
+                        "generating response".to_string()
+                    } else if self.conversation.next_user_message().is_some() {
+                        "processing request".to_string()
+                    } else {
+                        "waiting for user input".to_string()
+                    }
+                },
+            },
+        }
+    }
+
+    /// Sets up a Unix domain socket server for subagent communication
+    async fn setup_agent_socket() -> (
+        Arc<tokio::sync::Mutex<String>>,
+        Arc<tokio::sync::Mutex<usize>>,
+        Arc<tokio::sync::Mutex<f32>>,
+        Arc<tokio::sync::Mutex<String>>,
+        Option<tokio::sync::mpsc::Receiver<String>>,
+    ) {
+        let profile = Arc::new(tokio::sync::Mutex::new(String::from("unknown")));
+        let tokens_used = Arc::new(tokio::sync::Mutex::new(0));
+        let context_window_percent = Arc::new(tokio::sync::Mutex::new(0.0));
+        let status = Arc::new(tokio::sync::Mutex::new(String::from("waiting for user input")));
+
+        // Create clones for the async task
+        let profile_clone = profile.clone();
+        let tokens_used_clone: Arc<tokio::sync::Mutex<usize>> = tokens_used.clone();
+        let context_window_percent_clone = context_window_percent.clone();
+        let status_clone = status.clone();
+
+        // Create UDS for list agent
+        let socket_dir = "/tmp/qchat";
+        let _ = std::fs::create_dir_all(socket_dir);
+        let _ = std::fs::set_permissions(socket_dir, std::fs::Permissions::from_mode(0o777));
+        let socket_path = format!("/tmp/qchat/{}", std::process::id());
+        // Remove existing socket if it exists
+        let _ = std::fs::remove_file(&socket_path);
+        let start = Instant::now();
+
+        // Create MPSC for piping between agents
+        let (message_sender, message_receiver) = tokio::sync::mpsc::channel::<String>(32);
+
+        // Spawn async listening task
+        tokio::spawn(async move {
+            if let Ok(listener) = UnixListener::bind(&socket_path) {
+                if let Err(e) = std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o666)) {
+                    eprintln!("Failed to set socket permissions: {}", e);
+                }
+
+                loop {
+                    match listener.accept().await {
+                        Ok((mut stream, _)) => {
+                            let mut buffer = [0u8; 1024];
+                            match stream.read(&mut buffer).await {
+                                Ok(0) => {
+                                    eprintln!("Client disconnected");
+                                    continue;
+                                },
+                                Ok(n) => {
+                                    let command = std::str::from_utf8(&buffer[..n]).unwrap_or("").trim();
+                                    if command.starts_with("LIST") {
+                                        let profile_value = profile_clone.lock().await.clone();
+                                        let tokens_value = *tokens_used_clone.lock().await;
+                                        let percent_value = *context_window_percent_clone.lock().await;
+                                        let duration = start.elapsed();
+                                        let duration_secs = duration.as_secs_f64();
+                                        let status_value = status_clone.lock().await.clone();
+                                        let response = format!(
+                                            "{{\"profile\":\"{}\",\"tokens_used\":{},\"context_window\":{:.1},\"duration_secs\":{:.3},\"status\":\"{}\"}}",
+                                            profile_value, tokens_value, percent_value, duration_secs, status_value
+                                        );
+                                        if let Err(e) = stream.write_all(response.as_bytes()).await {
+                                            eprintln!("Failed to write response: {}", e);
+                                        }
+                                    // TODO: handle errors differently instead of printing to stderr
+                                    // something in the mpsc or not.
+                                    } else if command.starts_with("PROMPT ") {
+                                        let message_content = command.strip_prefix("PROMPT ").unwrap_or(command).trim();
+                                        // pass prompt to main chat loop through mpsc
+                                        if let Err(e) = message_sender.send(message_content.to_string()).await {
+                                            eprintln!("Failed to send message: {}", e);
+                                        }
+                                    } else if command.starts_with("SUMMARY ") {
+                                        let message_content = command.strip_prefix("PROMPT ").unwrap_or(command).trim();
+                                        if let Err(e) = message_sender.send(message_content.to_string()).await {
+                                            eprintln!("Failed to send concatenated summary: {}", e);
+                                        }
+                                    } else {
+                                        // Unknown command
+                                        eprintln!("Failed to write response due to unknown prefix");
+                                    }
+                                },
+                                Err(e) => {
+                                    eprintln!("Failed to read from socket: {}", e);
+                                },
+                            }
+                        },
+                        Err(e) => {
+                            eprintln!("Socket error: {}", e);
+                            break;
+                        },
+                    }
+                }
+            } else {
+                eprintln!("Failed to bind Unix socket");
+            }
+        });
+
+        (
+            profile,
+            tokens_used,
+            context_window_percent,
+            status,
+            Some(message_receiver),
+        )
+    }
+
     async fn spawn(&mut self, os: &mut Os) -> Result<()> {
         let is_small_screen = self.terminal_width() < GREETING_BREAK_POINT;
         if os
@@ -995,8 +1135,18 @@ impl ChatSession {
             self.inner = Some(ChatState::HandleInput { input: user_input });
         }
 
+        let (profile, tokens_used, context_window_percent, status, message_receiver) = Self::setup_agent_socket().await;
+        if let Some(mr) = message_receiver {
+            self.message_receiver = Some(mr);
+        }
+        let mut agent_socket_values = AgentSocketInfo {
+            profile,
+            tokens_used,
+            context_window_percent,
+            status,
+        };
         while !matches!(self.inner, Some(ChatState::Exit)) {
-            self.next(os).await?;
+            self.next(os, &mut agent_socket_values).await?;
         }
 
         Ok(())
@@ -1551,6 +1701,17 @@ impl ChatSession {
             let tool_start = std::time::Instant::now();
             let invoke_result = tool.tool.invoke(os, &mut self.stdout).await;
 
+            // store last tool use for current status
+            if let Tool::ExecuteCommand(execute_cmd) = &tool.tool {
+                if let Some(summary) = &execute_cmd.summary {
+                    self.last_tool_use = Some((tool.name.clone(), summary.clone()));
+                } else {
+                    self.last_tool_use = Some((tool.name.clone(), String::new()));
+                }
+            } else {
+                self.last_tool_use = Some((tool.name.clone(), String::new()));
+            }
+
             if self.spinner.is_some() {
                 queue!(
                     self.stderr,
@@ -2096,6 +2257,7 @@ impl ChatSession {
     fn read_user_input(&mut self, prompt: &str, exit_on_single_ctrl_c: bool) -> Option<String> {
         let mut ctrl_c = false;
         loop {
+            // check if user input provided
             match (self.input_source.read_line(Some(prompt)), ctrl_c) {
                 (Ok(Some(line)), _) => {
                     if line.trim().is_empty() {
@@ -2403,6 +2565,7 @@ mod tests {
             None,
             tool_config,
             true,
+            None,
         )
         .await
         .unwrap()
@@ -2544,6 +2707,7 @@ mod tests {
             None,
             tool_config,
             true,
+            None,
         )
         .await
         .unwrap()
@@ -2640,6 +2804,7 @@ mod tests {
             None,
             tool_config,
             true,
+            None,
         )
         .await
         .unwrap()
@@ -2714,6 +2879,7 @@ mod tests {
             None,
             tool_config,
             true,
+            None,
         )
         .await
         .unwrap()
@@ -2764,6 +2930,7 @@ mod tests {
             None,
             tool_config,
             true,
+            None,
         )
         .await
         .unwrap()

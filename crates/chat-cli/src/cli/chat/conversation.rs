@@ -784,6 +784,31 @@ impl ConversationState {
             },
         }
     }
+
+    // pub async fn send_state(&mut self) -> Result<String, std::io::Error> {
+    //     let pid = std::process::id();
+
+    //     // Get relevant state information
+    //     let profile = self.current_profile().unwrap_or("unknown profile");
+    //     let backend_state = self.backend_conversation_state(false, true).await;
+    //     let data = backend_state.calculate_conversation_size();
+    //     let context_token_count: usize = *data.context_messages;
+    //     let assistant_token_count: usize = *data.assistant_messages;
+    //     let user_token_count: usize = *data.user_messages;
+    //     let total_token_used: usize =
+    //     *data.context_messages + *data.assistant_messages + *data.user_messages;
+    //     let context_window_percent = (total_token_used as f32 / CONTEXT_WINDOW_SIZE as f32) * 100.0;
+
+    //     let mut state_map = HashMap::new();
+    //     state_map.insert("profile", profile.to_string());
+    //     state_map.insert("tokens_used", total_token_used.to_string());
+    //     state_map.insert("context_window", context_window_percent.to_string());
+
+    //     match serde_json::to_string(&state_map) {
+    //     Ok(json) => Ok(json),
+    //     Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e))
+    //     }
+    // }
 }
 
 /// Represents a conversation state that can be converted into a [FigConversationState] (the type

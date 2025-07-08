@@ -9,49 +9,26 @@ mod settings;
 mod user;
 
 use std::fmt::Display;
-use std::io::{
-    Write as _,
-    stdout,
-};
+use std::io::{Write as _, stdout};
 use std::process::ExitCode;
 
 use anstream::println;
 pub use chat::ConversationState;
-use clap::{
-    ArgAction,
-    CommandFactory,
-    Parser,
-    Subcommand,
-    ValueEnum,
-};
+use clap::{ArgAction, CommandFactory, Parser, Subcommand, ValueEnum};
 use crossterm::style::Stylize;
-use eyre::{
-    Result,
-    bail,
-};
+use eyre::{Result, bail};
 use feed::Feed;
 use serde::Serialize;
-use tracing::{
-    Level,
-    debug,
-};
+use tracing::{Level, debug};
 
 use crate::cli::chat::ChatArgs;
 use crate::cli::mcp::McpSubcommand;
-use crate::cli::user::{
-    LoginArgs,
-    WhoamiArgs,
-};
-use crate::logging::{
-    LogArgs,
-    initialize_logging,
-};
+use crate::cli::user::{LoginArgs, WhoamiArgs};
+use crate::logging::{LogArgs, initialize_logging};
 use crate::os::Os;
+use crate::subagents;
 use crate::util::directories::logs_dir;
-use crate::util::{
-    CLI_BINARY_NAME,
-    GOV_REGIONS,
-};
+use crate::util::{CLI_BINARY_NAME, GOV_REGIONS};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
 pub enum OutputFormat {
@@ -94,6 +71,8 @@ pub enum RootSubcommand {
     Whoami(WhoamiArgs),
     /// Show the profile associated with this idc user
     Profile,
+    /// Show the current running agents across processes
+    Agent(subagents::AgentArgs),
     /// Customize appearance & behavior
     #[command(alias("setting"))]
     Settings(settings::SettingsArgs),
@@ -168,6 +147,7 @@ impl Display for RootSubcommand {
             Self::Chat(_) => "chat",
             Self::Login(_) => "login",
             Self::Logout => "logout",
+            Self::Agent(_) => "agent",
             Self::Whoami(_) => "whoami",
             Self::Profile => "profile",
             Self::Settings(_) => "settings",
@@ -330,59 +310,80 @@ mod test {
     /// Test flag parsing for the top level [Cli]
     #[test]
     fn test_flags() {
-        assert_eq!(Cli::parse_from([CHAT_BINARY_NAME, "-v"]), Cli {
-            subcommand: None,
-            verbose: 1,
-            help_all: false,
-        });
+        assert_eq!(
+            Cli::parse_from([CHAT_BINARY_NAME, "-v"]),
+            Cli {
+                subcommand: None,
+                verbose: 1,
+                help_all: false,
+            }
+        );
 
-        assert_eq!(Cli::parse_from([CHAT_BINARY_NAME, "-vvv"]), Cli {
-            subcommand: None,
-            verbose: 3,
-            help_all: false,
-        });
+        assert_eq!(
+            Cli::parse_from([CHAT_BINARY_NAME, "-vvv"]),
+            Cli {
+                subcommand: None,
+                verbose: 3,
+                help_all: false,
+            }
+        );
 
-        assert_eq!(Cli::parse_from([CHAT_BINARY_NAME, "--help-all"]), Cli {
-            subcommand: None,
-            verbose: 0,
-            help_all: true,
-        });
+        assert_eq!(
+            Cli::parse_from([CHAT_BINARY_NAME, "--help-all"]),
+            Cli {
+                subcommand: None,
+                verbose: 0,
+                help_all: true,
+            }
+        );
 
-        assert_eq!(Cli::parse_from([CHAT_BINARY_NAME, "chat", "-vv"]), Cli {
-            subcommand: Some(RootSubcommand::Chat(ChatArgs {
-                resume: false,
-                input: None,
-                agent: None,
-                model: None,
-                trust_all_tools: false,
-                trust_tools: None,
-                no_interactive: false,
-                migrate: false,
-            })),
-            verbose: 2,
-            help_all: false,
-        });
+        assert_eq!(
+            Cli::parse_from([CHAT_BINARY_NAME, "chat", "-vv"]),
+            Cli {
+                subcommand: Some(RootSubcommand::Chat(ChatArgs {
+                    resume: false,
+                    input: None,
+                    agent: None,
+                    model: None,
+                    trust_all_tools: false,
+                    trust_tools: None,
+                    no_interactive: false,
+                    migrate: false,
+                })),
+                verbose: 2,
+                help_all: false,
+            }
+        );
     }
 
     #[test]
     fn test_version_changelog() {
-        assert_parse!(["version", "--changelog"], RootSubcommand::Version {
-            changelog: Some("".to_string()),
-        });
+        assert_parse!(
+            ["version", "--changelog"],
+            RootSubcommand::Version {
+                changelog: Some("".to_string()),
+            }
+        );
     }
 
     #[test]
     fn test_version_changelog_all() {
-        assert_parse!(["version", "--changelog=all"], RootSubcommand::Version {
-            changelog: Some("all".to_string()),
-        });
+        assert_parse!(
+            ["version", "--changelog=all"],
+            RootSubcommand::Version {
+                changelog: Some("all".to_string()),
+            }
+        );
     }
 
     #[test]
     fn test_version_changelog_specific() {
-        assert_parse!(["version", "--changelog=1.8.0"], RootSubcommand::Version {
-            changelog: Some("1.8.0".to_string()),
-        });
+        assert_parse!(
+            ["version", "--changelog=1.8.0"],
+            RootSubcommand::Version {
+                changelog: Some("1.8.0".to_string()),
+            }
+        );
     }
 
     #[test]

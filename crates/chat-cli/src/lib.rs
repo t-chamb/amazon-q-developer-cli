@@ -11,6 +11,7 @@ pub mod logging;
 pub mod mcp_client;
 pub mod os;
 pub mod request;
+pub mod subagents;
 pub mod telemetry;
 pub mod util;
 
