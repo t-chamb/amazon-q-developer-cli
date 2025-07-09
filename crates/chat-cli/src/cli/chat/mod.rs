@@ -739,15 +739,31 @@ impl ChatSession {
                 },
                 ApiClientError::QuotaBreach { message, .. } => (message, Report::from(err), true),
                 ApiClientError::ModelOverloadedError { request_id, .. } => {
+                    let model_instruction = if self.interactive {
+                        "Please use '/model' to select a different model and try again."
+                    } else {
+                        "Please relaunch with '--model <model_id>' to use a different model."
+                    };
+
                     let err = format!(
-                        "The model you've selected is temporarily unavailable. Please use '/model' to select a different model and try again.{}\n\n",
+                        "The model you've selected is temporarily unavailable. {}{}\n\n",
+                        model_instruction,
                         match request_id {
                             Some(id) => format!("\n    Request ID: {}", id),
                             None => "".to_owned(),
                         }
                     );
                     self.conversation.append_transcript(err.clone());
-                    ("Amazon Q is having trouble responding right now", eyre!(err), true)
+                    execute!(
+                        self.stderr,
+                        style::SetAttribute(Attribute::Bold),
+                        style::SetForegroundColor(Color::Red),
+                        style::Print("Amazon Q is having trouble responding right now:\n"),
+                        style::Print(format!("    {}\n", err.clone())),
+                        style::SetAttribute(Attribute::Reset),
+                        style::SetForegroundColor(Color::Reset),
+                    )?;
+                    ("Amazon Q is having trouble responding right now", eyre!(err), false)
                 },
                 ApiClientError::MonthlyLimitReached { .. } => {
                     let subscription_status = get_subscription_status(os).await;
