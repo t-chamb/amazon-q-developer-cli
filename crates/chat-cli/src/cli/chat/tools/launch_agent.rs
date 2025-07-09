@@ -43,11 +43,12 @@ use crate::os::Os;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubAgent {
     // 3-5 word unique name to identify agent
-    pub agent_name: String,
+    pub agent_display_name: String,
     /// The prompt to send to the new agent
     pub prompt: String,
+    pub prompt_summary: String,
     /// Optional model to use for the agent (defaults to the system default)
-    pub model: Option<String>,
+    pub agent_cli_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,27 +88,20 @@ impl SubAgentWrapper {
                 style::Print("  • "),
                 style::SetForegroundColor(Color::White),
                 style::SetAttribute(Attribute::Bold),
-                style::Print(&agent.agent_name),
+                style::Print(&agent.agent_display_name),
                 style::ResetColor,
                 style::SetForegroundColor(Color::DarkGrey),
                 style::Print(" ("),
-                style::Print(agent.model.clone().unwrap_or_else(|| "Claude-3.7-Sonnet".to_string())),
+                style::Print(agent.agent_cli_name.clone().unwrap_or_else(|| "Default".to_string())),
                 style::Print(")\n"),
                 style::ResetColor,
             )?;
-
-            // Show truncated prompt preview
-            let prompt_preview = if agent.prompt.len() > 60 {
-                format!("{}...", &agent.prompt[..57])
-            } else {
-                agent.prompt.clone()
-            };
 
             queue!(
                 updates,
                 style::SetForegroundColor(Color::DarkGrey),
                 style::Print("    "),
-                style::Print(prompt_preview),
+                style::Print(&agent.prompt_summary),
                 style::Print("\n\n"),
                 style::ResetColor,
             )?;
@@ -151,16 +145,17 @@ impl SubAgent {
         // Spawns a new async task for each subagent with enhanced prompt
         for agent in agents {
             let curr_prompt = prompt_template.replace("{}", &agent.prompt);
-            let model_clone = agent.model.clone();
+            let agent_cli_clone = agent.agent_cli_name.clone();
             let tx_clone = progress_tx.clone();
-            let handle = spawn_agent_task(curr_prompt, model_clone, tx_clone).await?;
+            let handle = spawn_agent_task(curr_prompt, agent_cli_clone, tx_clone).await?;
             child_pids.push(handle.0);
             task_handles.push(handle.1);
         }
 
-        // 1 second wait for q to spawn chat child process and wait on that pid
+        // 300ms wait for q to spawn chat child process and wait on that pid
+        tokio::time::sleep(Duration::from_secs(1)).await;
         for child_pid in child_pids {
-            grand_child_pids.push(wait_for_grandchild(child_pid).await?);
+            grand_child_pids.push(get_grandchild_pid(child_pid).await?);
         }
 
         // Track completed progress with regular status updates
@@ -169,8 +164,24 @@ impl SubAgent {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
         let mut first_print = true;
         let mut spinner: Option<Spinner> = None;
-        queue!(updates, style::Print("\n"))?;
-        updates.flush()?;
+
+        // Move cursor to top of current
+        // Right after this section:
+        let num_empty_lines = 9;
+        let lines_to_move_up = 3 * agents.len() + num_empty_lines;
+        queue!(
+            updates,
+            cursor::MoveUp(lines_to_move_up as u16),
+            cursor::MoveToColumn(0),
+            Clear(ClearType::CurrentLine),
+            style::SetAttribute(Attribute::Bold),
+            style::Print(" ● "),
+            style::SetForegroundColor(Color::Green),
+            style::Print(format!("Successfully launched {} Q agent(s)\n\n", agents.len())),
+            style::ResetColor,
+            style::Print("─".repeat(50)),
+            style::Print("\n\n"),
+        )?;
 
         // Displays subagent status update every 5 seconds until join
         loop {
@@ -194,6 +205,13 @@ impl SubAgent {
                 }
 
                 _ = interval.tick() => {
+
+                    // Stop spinner FIRST before any cursor operations for smoothness
+                    if let Some(mut temp_spinner) = spinner.take() {
+                        temp_spinner.stop();
+                    }
+                    updates.flush()?;
+
                     let mut status_output = String::new();
                     let mut new_lines_printed = 0;
 
@@ -216,9 +234,9 @@ impl SubAgent {
                             style::SetForegroundColor(Color::Blue),
                             style::SetForegroundColor(Color::White),
                             style::SetAttribute(Attribute::Bold),
-                            agent.agent_name,
+                            agent.agent_display_name,
                             style::ResetColor,
-                            agent.model.clone().unwrap_or_else(|| "Claude-3.7-Sonnet".to_string()),
+                            agent.agent_cli_name.clone().unwrap_or_else(|| "Default".to_string()),
                             style::ResetColor,
                             style::SetForegroundColor(Color::Cyan),
                             status,
@@ -228,27 +246,23 @@ impl SubAgent {
                         new_lines_printed += 3;
                     }
 
-                    if let Some(mut temp_spinner) = spinner.take() {
-                        temp_spinner.stop();
-                    }
-                    updates.flush()?;
-
-                    // batch update - move cursor back to top & clear if not first print, then display everything
+                    // batch update - move cursor back to top & clear, then display everything
                     if !first_print {
                         queue!(
                             updates,
-                            cursor::MoveUp(new_lines_printed),
+                            cursor::MoveUp(new_lines_printed as u16),
                             cursor::MoveToColumn(0),
                             Clear(ClearType::FromCursorDown),
                             style::Print(status_output)
                         )?;
                     } else {
-                        queue!(updates, style::Print(status_output))?;
+                        queue!(updates, cursor::MoveToColumn(0), Clear(ClearType::FromCursorDown), style::Print(status_output))?;
                         first_print = false;
                     }
+                    updates.flush()?;
+
                     spinner = Some(Spinner::new(Spinners::Dots,
                         format!("Progress: {}/{} agents complete", completed, agents.len())));
-                    updates.flush()?;
                 }
             }
         }
@@ -286,7 +300,6 @@ async fn get_agent_status(child_pid: u32) -> Result<String, eyre::Error> {
             if n == 0 {
                 return Ok("No response".to_string());
             }
-
             let response_str = std::str::from_utf8(&buffer[..n]).unwrap_or("<invalid utf8>");
             match serde_json::from_str::<serde_json::Value>(&response_str) {
                 Ok(json) => {
@@ -304,14 +317,14 @@ async fn get_agent_status(child_pid: u32) -> Result<String, eyre::Error> {
 /// Runs a q subagent process as an async tokio task with specified prompt and model
 async fn spawn_agent_task(
     prompt: String,
-    model: Option<String>,
+    agent_cli_name: Option<String>,
     tx: tokio::sync::mpsc::Sender<u32>,
 ) -> Result<(u32, tokio::task::JoinHandle<Result<String, eyre::Error>>), eyre::Error> {
     // Run subagent with trust all tools + Q_SUBAGENT env var = 1
     let mut cmd = tokio::process::Command::new("q");
     cmd.arg("chat");
-    if let Some(model_arg) = model {
-        cmd.arg(format!("--model={}", model_arg));
+    if let Some(agent_arg) = agent_cli_name {
+        cmd.arg(format!("--agent={}", agent_arg));
     }
     cmd.arg("--no-interactive");
     cmd.arg("--trust-all-tools");
@@ -411,6 +424,7 @@ fn process_agent_results(
 }
 
 /// Async function that captures stdout from a reader and extracts summary only from stdout
+/// Reads until STDOUT pipe closes ie when child process exits
 async fn capture_stdout_and_log(
     stdout: tokio::process::ChildStdout,
     mut debug_log: std::fs::File,
@@ -432,15 +446,4 @@ async fn capture_stdout_and_log(
         }
     }
     Ok(output)
-}
-
-/// checks if process with pid=child_pid has a grandchild every 500 seconds for 2.5 seconds max
-async fn wait_for_grandchild(child_pid: u32) -> Result<u32> {
-    for _ in 0..5 {
-        if let Ok(pid) = get_grandchild_pid(child_pid).await {
-            return Ok(pid);
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-    Err(eyre::eyre!("Failed to get child PID for pid {}", child_pid))
 }

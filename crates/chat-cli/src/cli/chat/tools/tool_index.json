@@ -294,7 +294,7 @@
           "items": {
             "type": "object",
             "properties": {
-              "agent_name": {
+              "agent_display_name": {
                 "type": "string",
                 "description": "Brief 3-5 word description of the subagent's role, which uniquely identifies the task it is completing. Ensure the last word is always 'Agent'."
               },
@@ -302,12 +302,16 @@
                 "type": "string",
                 "description": "Detailed, actionable instructions for the subagent's task. Include specific goals, required outputs, methodology, and any constraints. Be precise about what information or artifacts the subagent should produce and how they should be formatted. Each subagent should have a clearly defined, focused responsibility. Ensure that the prompting also indicates that they are a subagent so that they can act accordingly."
               },
-              "model": {
+              "agent_cli_name": {
+              "type": "string",
+              "description": "REQUIRED: First check available agents by running `ls -la ~/.aws/amazonq/agents`. Then select the most suitable specialized agent for this specific task by omitting the .json from the filename. Only specify this field if a relevant specialized agent exists. If no agent particularly matches the task requirements, omit this field to use the default agent. Always verify agent availability before selection."
+              },
+              "prompt_summary": {
                 "type": "string",
-                "description": "Optional model for subagent to use (e.g., 'claude-3.5-sonnet', 'claude-3.7-sonnet', 'claude-4-sonnet'). Defaults to system default if not specified."
+                "description":"A short 1-2 sentence summarizing the associated prompt field that will be displayed to the user."
               }
             },
-            "required": ["agent_name", "prompt"]
+            "required": ["prompt", "prompt_summary"]
           }
         }
       },
